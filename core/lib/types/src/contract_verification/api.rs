@@ -363,12 +363,34 @@ impl CompilationArtifacts {
         for span in &self.factory_dependency_refs {
             let start = span.start;
             let end = start + span.length;
-            if end <= compiled_code.len() && end <= deployed_code.len() {
-                compiled_code[start..end].fill(0);
-                deployed_code[start..end].fill(0);
+            if end > compiled_code.len() || end > deployed_code.len() {
+                continue;
             }
+            // A linked factory dependency hash occupies a full, word-aligned EraVM word,
+            // and any legitimately-substituted value is itself a well-formed EraVM bytecode
+            // hash. Refuse to mask anything else, so an ordinary runtime constant that merely
+            // collides with a dependency hash stays part of the bytecode comparison.
+            if start % 32 != 0
+                || span.length != 32
+                || !is_eravm_bytecode_hash(&deployed_code[start..end])
+            {
+                continue;
+            }
+            compiled_code[start..end].fill(0);
+            deployed_code[start..end].fill(0);
         }
     }
+}
+
+/// Checks whether `word` has the structure of an EraVM bytecode hash, the format used for
+/// linked factory dependency hashes: a 32-byte value whose first byte is the EraVM marker,
+/// second byte is zero, and word-length field is odd (EraVM bytecodes have an odd number of
+/// 32-byte words).
+fn is_eravm_bytecode_hash(word: &[u8]) -> bool {
+    word.len() == 32
+        && word[0] == BytecodeMarker::EraVm as u8
+        && word[1] == 0
+        && u16::from_be_bytes([word[2], word[3]]) % 2 == 1
 }
 
 /// Non-critical issues detected during verification.
@@ -419,7 +441,19 @@ mod tests {
     use assert_matches::assert_matches;
 
     use super::*;
-    use crate::contract_verification::contract_identifier::{CborCompilerVersion, CborMetadata};
+    use crate::contract_verification::contract_identifier::{
+        CborCompilerVersion, CborMetadata, ContractIdentifier, Match,
+    };
+
+    /// Builds a value with the structure of an EraVM bytecode hash (marker byte, zero reserved
+    /// byte, odd word-length field), varying only by `tag` in the hash tail.
+    fn eravm_bytecode_hash(tag: u8) -> [u8; 32] {
+        let mut hash = [tag; 32];
+        hash[0] = BytecodeMarker::EraVm as u8;
+        hash[1] = 0;
+        hash[2..4].copy_from_slice(&1u16.to_be_bytes());
+        hash
+    }
 
     #[test]
     fn source_code_deserialization() {
@@ -758,16 +792,75 @@ mod tests {
             abi: serde_json::Value::Array(vec![]),
             immutable_refs: Default::default(),
             factory_dependency_refs: vec![ImmutableReference {
-                start: 4,
-                length: 4,
+                start: 32,
+                length: 32,
             }],
         };
-        let mut compiled = vec![1, 2, 3, 4, 0xaa, 0xaa, 0xaa, 0xaa, 9];
-        let mut deployed = vec![1, 2, 3, 4, 0xbb, 0xbb, 0xbb, 0xbb, 9];
+        let mut compiled = [0x11; 32].to_vec();
+        compiled.extend_from_slice(&eravm_bytecode_hash(0xaa));
+        let mut deployed = [0x11; 32].to_vec();
+        deployed.extend_from_slice(&eravm_bytecode_hash(0xbb));
 
         artifacts.patch_immutable_bytecodes(&mut compiled, &mut deployed);
 
-        assert_eq!(compiled, vec![1, 2, 3, 4, 0, 0, 0, 0, 9]);
-        assert_eq!(deployed, vec![1, 2, 3, 4, 0, 0, 0, 0, 9]);
+        let mut expected = [0x11; 32].to_vec();
+        expected.extend_from_slice(&[0; 32]);
+        assert_eq!(compiled, expected);
+        assert_eq!(deployed, expected);
+    }
+
+    #[test]
+    fn does_not_mask_runtime_constant_colliding_with_dependency_hash() {
+        // A legitimately linked dependency hash lives at offset 32; an ordinary runtime
+        // constant that happens to equal the same hash lives at offset 64. Only the deployed
+        // link slot holds another well-formed EraVM bytecode hash, so only it may be masked.
+        let dependency_hash = eravm_bytecode_hash(0xaa);
+        let attacker_constant = [0xcc; 32];
+
+        let build = |link_slot: &[u8; 32], constant: &[u8; 32]| {
+            let mut bytecode = [0x11; 32].to_vec();
+            bytecode.extend_from_slice(link_slot);
+            bytecode.extend_from_slice(constant);
+            bytecode.extend_from_slice(&[0x22; 32]);
+            bytecode.extend_from_slice(&[0x33; 32]);
+            bytecode
+        };
+        let mut compiled = build(&dependency_hash, &dependency_hash);
+        let mut deployed = build(&eravm_bytecode_hash(0xbb), &attacker_constant);
+
+        assert_eq!(
+            ContractIdentifier::from_bytecode(BytecodeMarker::EraVm, &compiled).matches(
+                &ContractIdentifier::from_bytecode(BytecodeMarker::EraVm, &deployed)
+            ),
+            Match::None
+        );
+
+        let artifacts = CompilationArtifacts {
+            bytecode: compiled.clone(),
+            deployed_bytecode: None,
+            abi: serde_json::Value::Array(vec![]),
+            immutable_refs: Default::default(),
+            factory_dependency_refs: vec![
+                ImmutableReference {
+                    start: 32,
+                    length: 32,
+                },
+                ImmutableReference {
+                    start: 64,
+                    length: 32,
+                },
+            ],
+        };
+
+        artifacts.patch_immutable_bytecodes(&mut compiled, &mut deployed);
+
+        // The tampered runtime constant at offset 64 remains, so the mismatch is still visible.
+        assert_eq!(&deployed[64..96], &attacker_constant);
+        assert_eq!(
+            ContractIdentifier::from_bytecode(BytecodeMarker::EraVm, &compiled).matches(
+                &ContractIdentifier::from_bytecode(BytecodeMarker::EraVm, &deployed)
+            ),
+            Match::None
+        );
     }
 }

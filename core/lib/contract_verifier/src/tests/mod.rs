@@ -1181,9 +1181,9 @@ async fn verifying_era_vm_with_factory_dependency_hash_ref() {
     prepare_storage(&mut storage).await;
 
     let mut compiled_bytecode = vec![0x11; 96];
-    compiled_bytecode[32..64].copy_from_slice(&[0xaa; 32]);
+    compiled_bytecode[32..64].copy_from_slice(&eravm_dependency_hash(0xaa));
     let mut deployed_bytecode = compiled_bytecode.clone();
-    deployed_bytecode[32..64].copy_from_slice(&[0xbb; 32]);
+    deployed_bytecode[32..64].copy_from_slice(&eravm_dependency_hash(0xbb));
 
     let address = Address::repeat_byte(1);
     mock_deployment(&mut storage, address, deployed_bytecode, &[]).await;
@@ -1229,13 +1229,13 @@ async fn metadata_version_fallback_patches_factory_dependency_hash_refs() {
 
     let cbor_metadata = eravm_cbor_metadata_suffix_for_zksolc(ZKSOLC_VERSION_WITH_CBOR);
     let mut matching_bytecode = vec![0x11; 96];
-    matching_bytecode[32..64].copy_from_slice(&[0xaa; 32]);
+    matching_bytecode[32..64].copy_from_slice(&eravm_dependency_hash(0xaa));
     matching_bytecode.extend_from_slice(&[0; 32]);
     matching_bytecode.extend_from_slice(&cbor_metadata);
     assert_eq!(matching_bytecode.len() / 32 % 2, 1);
 
     let mut deployed_bytecode = matching_bytecode.clone();
-    deployed_bytecode[32..64].copy_from_slice(&[0xbb; 32]);
+    deployed_bytecode[32..64].copy_from_slice(&eravm_dependency_hash(0xbb));
 
     let mut wrong_version_bytecode = matching_bytecode.clone();
     wrong_version_bytecode[0..32].copy_from_slice(&[0xcc; 32]);
@@ -1282,6 +1282,16 @@ async fn metadata_version_fallback_patches_factory_dependency_hash_refs() {
     verifier.run(stop_receiver, Some(1)).await.unwrap();
 
     assert_request_success(&mut storage, request_id, address, &expected_bytecode, &[]).await;
+}
+
+/// Builds a value with the structure of an EraVM bytecode hash (marker byte, zero reserved byte,
+/// odd word-length field), as used for linked factory dependency hashes.
+fn eravm_dependency_hash(tag: u8) -> [u8; 32] {
+    let mut hash = [tag; 32];
+    hash[0] = 1;
+    hash[1] = 0;
+    hash[2..4].copy_from_slice(&1u16.to_be_bytes());
+    hash
 }
 
 fn eravm_cbor_metadata_suffix_for_zksolc(version: &str) -> Vec<u8> {

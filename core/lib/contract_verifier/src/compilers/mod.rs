@@ -211,12 +211,15 @@ fn parse_factory_dependency_refs(contract: &Value, bytecode: &[u8]) -> Vec<Immut
             continue;
         }
 
+        // EraVM stores linked factory-dependency hashes as full, 32-byte-aligned words.
+        // Only aligned occurrences can be genuine link slots; unaligned matches would
+        // otherwise mask ordinary runtime constants that merely collide with a hash.
         refs.extend(
             bytecode
                 .windows(hash.len())
                 .enumerate()
                 .filter_map(|(start, window)| {
-                    (window == hash.as_slice()).then_some(ImmutableReference {
+                    (start % 32 == 0 && window == hash.as_slice()).then_some(ImmutableReference {
                         start,
                         length: hash.len(),
                     })
@@ -401,7 +404,10 @@ mod parser_tests {
     #[test]
     fn parses_factory_dependency_hash_refs() {
         let dependency_hash = "010002f3aa6cac6815f2300b1a4ed078983900fa5a0268f6575db307b09ae610";
-        let bytecode = format!("11223344{dependency_hash}55667788{dependency_hash}");
+        // Place the hash at two word-aligned offsets (0 and 64); the 32-byte zero filler word
+        // sits between them.
+        let filler = "00".repeat(32);
+        let bytecode = format!("{dependency_hash}{filler}{dependency_hash}");
         let output = serde_json::json!({
             "contracts": {
                 "Counter.sol": {
@@ -432,14 +438,49 @@ mod parser_tests {
             artifacts.factory_dependency_refs,
             vec![
                 zksync_types::contract_verification::api::ImmutableReference {
-                    start: 4,
+                    start: 0,
                     length: 32,
                 },
                 zksync_types::contract_verification::api::ImmutableReference {
-                    start: 40,
+                    start: 64,
                     length: 32,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn skips_unaligned_factory_dependency_hash_matches() {
+        let dependency_hash = "010002f3aa6cac6815f2300b1a4ed078983900fa5a0268f6575db307b09ae610";
+        // The hash appears only at unaligned byte offset 4, so it cannot be a genuine
+        // EraVM link slot and must not be recorded.
+        let bytecode = format!("11223344{dependency_hash}55667788");
+        let output = serde_json::json!({
+            "contracts": {
+                "Counter.sol": {
+                    "Counter": {
+                        "abi": [],
+                        "evm": {
+                            "bytecode": {
+                                "object": bytecode,
+                            }
+                        },
+                        "factoryDependencies": {
+                            dependency_hash: "CounterDependency.sol:CounterDependency"
+                        }
+                    }
+                }
+            }
+        });
+
+        let artifacts = parse_standard_json_output(
+            &output,
+            "Counter".to_owned(),
+            "Counter.sol".to_owned(),
+            false,
+        )
+        .unwrap();
+
+        assert!(artifacts.factory_dependency_refs.is_empty());
     }
 }
